@@ -1,0 +1,12 @@
+{
+    "display_name": "Memory Processor",
+    "loading_order": 10,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "Your Name",
+    "version": "1.2.0",
+    "homePage": "https://github.com/miyamimic/memory-processor",
+    "auto_update": true
+}
