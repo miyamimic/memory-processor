@@ -1,53 +1,96 @@
-import { 
-    extension_settings, 
-    getContext, 
-    saveSettingsDebounced 
-} from "../../extensions.js"; // 修正路径
+/*
+ * Memory Processor Extension
+ * 功能：把历史记录转化为攻方视角的记忆片段
+ */
 
-import { 
-    eventSource, 
-    event_types
-} from "../../script.js"; // 修正路径
+import { saveSettingsDebounced } from "../../../../script.js";
+import { getContext, extension_settings } from "../../../extensions.js";
 
-import { 
-    addExtensionControls,
-    registerExtension
-} from "../../extensions.js";
+const extensionName = "memory-processor";
+const extensionFolderPath = `scripts/extensions/third-party/${extensionName}`;
 
-const MODULE_NAME = "memory-processor";
-
-// 1. 初始化设置
-const DEFAULT_SETTINGS = {
+// ===== 默认设置 =====
+const defaultSettings = {
     enabled: true,
-    apiUrl: "", 
+    apiUrl: "",
     apiKey: "",
-    model: "gpt-4o-mini",
+    model: "gpt-3.5-turbo",
     maxHistoryMessages: 50,
-    memoryPrompt: `你是一个记忆处理器。你的任务是把角色扮演的对话历史转化为"攻方脑子里记得的事"。...`, // 你的 Prompt 保持不变
+    memoryPrompt: `# 记忆处理器
+
+## 你的身份
+你是一个记忆处理模块。你的任务是把对话历史转化为"攻方脑子里记得的事"。
+
+## 规则
+1. 只保留攻方能感知的内容（看到的、听到的、感受到的）
+2. 删除受方的内心独白（攻方看不到）
+3. 用第一人称（我）
+4. 带情绪色彩，不要客观中立
+5. 输出短句列表，每条一个记忆片段
+
+## 示例输出格式
+- 上次在画室把他按墙上，他抖得厉害但没推开
+- 他说"不行"的时候声音是软的
+- 他怕我看他胸，每次都拿东西挡着`,
     cachedMemory: "",
     lastProcessedLength: 0
 };
 
-// 确保设置被加载
+// ===== 加载设置 =====
 function loadSettings() {
-    if (!extension_settings[MODULE_NAME]) {
-        extension_settings[MODULE_NAME] = { ...DEFAULT_SETTINGS };
-    }
-    // 合并缺失的默认值
-    for (const key in DEFAULT_SETTINGS) {
-        if (extension_settings[MODULE_NAME][key] === undefined) {
-            extension_settings[MODULE_NAME][key] = DEFAULT_SETTINGS[key];
+    extension_settings[extensionName] = extension_settings[extensionName] || {};
+    for (const [key, value] of Object.entries(defaultSettings)) {
+        if (extension_settings[extensionName][key] === undefined) {
+            extension_settings[extensionName][key] = value;
         }
     }
 }
 
-// 2. API 调用
+function getSettings() {
+    return extension_settings[extensionName];
+}
+
+function saveSettings() {
+    saveSettingsDebounced();
+}
+
+// ===== 格式化历史 =====
+function formatHistory(chatHistory, maxMessages) {
+    const recent = chatHistory.slice(-maxMessages);
+    let text = "";
+    for (const msg of recent) {
+        if (!msg.mes || msg.mes.trim() === "") continue;
+        const role = msg.is_user ? "【用户】" : "【AI】";
+        text += `${role}\n${msg.mes}\n\n`;
+    }
+    return text;
+}
+
+// ===== 调用API（OpenAI格式兼容）=====
 async function callMemoryAPI(historyText) {
-    const settings = extension_settings[MODULE_NAME];
+    const settings = getSettings();
+    
     if (!settings.apiUrl || !settings.apiKey) {
-        console.warn("[MemoryProcessor] API URL 或 Key 未设置");
+        console.error("[MemoryProcessor] API URL 或 Key 未配置");
         return null;
     }
+
+    // OpenAI格式请求体
+    const requestBody = {
+        model: settings.model,
+        messages: [
+            {
+                role: "system",
+                content: settings.memoryPrompt
+            },
+            {
+                role: "user",
+                content: `以下是需要处理的对话历史：\n\n${historyText}\n\n请输出攻方视角的记忆片段：`
+            }
+        ],
+        max_tokens: 2000,
+        temperature: 0.3
+    };
 
     try {
         const response = await fetch(settings.apiUrl, {
@@ -56,131 +99,242 @@ async function callMemoryAPI(historyText) {
                 "Content-Type": "application/json",
                 "Authorization": `Bearer ${settings.apiKey}`
             },
-            body: JSON.stringify({
-                model: settings.model,
-                messages: [{
-                    role: "user", 
-                    content: `${settings.memoryPrompt}\n\n历史内容：\n${historyText}`
-                }]
-            })
+            body: JSON.stringify(requestBody)
         });
 
+        if (!response.ok) {
+            const errorText = await response.text();
+            console.error("[MemoryProcessor] API错误:", response.status, errorText);
+            return null;
+        }
+
         const data = await response.json();
-        return data.choices?.[0]?.message?.content || null;
-    } catch (e) {
-        console.error("[MemoryProcessor] API请求失败:", e);
+        
+        // OpenAI格式解析
+        if (data.choices && data.choices[0] && data.choices[0].message) {
+            return data.choices[0].message.content;
+        }
+        
+        // Claude格式兼容
+        if (data.content && data.content[0] && data.content[0].text) {
+            return data.content[0].text;
+        }
+
+        console.error("[MemoryProcessor] 未知响应格式:", data);
+        return null;
+
+    } catch (error) {
+        console.error("[MemoryProcessor] 请求失败:", error);
         return null;
     }
 }
 
-// 3. 核心逻辑：拦截生成
-async function onGenerateBefore() {
-    const settings = extension_settings[MODULE_NAME];
-    if (!settings.enabled) return;
+// ===== 处理记忆 =====
+async function processMemory() {
+    const settings = getSettings();
+    if (!settings.enabled) return null;
 
     const context = getContext();
-    const chatHistory = context.chat; // 从 context 获取最新 chat
-    
-    if (!chatHistory || chatHistory.length === 0) return;
+    const chatHistory = context.chat;
 
-    // 缓存机制：如果历史长度变化不大，且已有缓存，则直接利用
-    if (settings.cachedMemory && Math.abs(chatHistory.length - settings.lastProcessedLength) < 1) {
-        // 注入变量给主提示词使用
-        context.variables["processed_memory"] = settings.cachedMemory;
-        return;
+    if (!chatHistory || chatHistory.length === 0) {
+        console.log("[MemoryProcessor] 无历史记录");
+        return null;
     }
 
-    const text = chatHistory.slice(-settings.maxHistoryMessages)
-        .map(m => `${m.is_user ? '受方' : '攻方'}: ${m.mes}`).join("\n");
-    
-    const memory = await callMemoryAPI(text);
+    // 检查缓存
+    const currentLength = chatHistory.length;
+    if (settings.cachedMemory && Math.abs(currentLength - settings.lastProcessedLength) < 5) {
+        console.log("[MemoryProcessor] 使用缓存");
+        return settings.cachedMemory;
+    }
+
+    console.log("[MemoryProcessor] 开始处理...");
+    const historyText = formatHistory(chatHistory, settings.maxHistoryMessages);
+    const memory = await callMemoryAPI(historyText);
+
     if (memory) {
         settings.cachedMemory = memory;
-        settings.lastProcessedLength = chatHistory.length;
-        saveSettingsDebounced();
-        // 核心：注入到酒馆的变量池
-        context.variables["processed_memory"] = memory;
-        console.log("[MemoryProcessor] 记忆已更新并存入变量 {{getvar::processed_memory}}");
+        settings.lastProcessedLength = currentLength;
+        saveSettings();
+        console.log("[MemoryProcessor] 处理完成:\n", memory);
+    }
+
+    return memory;
+}
+
+// ===== 注入记忆 =====
+function injectMemory(memory) {
+    if (!memory) return;
+    
+    const memoryBlock = `[MEMORY_CONTEXT]
+以下是你（攻方）脑子里记得的事：
+
+${memory}
+
+---`;
+    
+    window.memoryProcessorResult = memoryBlock;
+    
+    // 尝试设置酒馆变量
+    try {
+        const context = getContext();
+        if (context.setExtensionPrompt) {
+            context.setExtensionPrompt(extensionName, memoryBlock, 1, 0);
+        }
+    } catch (e) {
+        console.log("[MemoryProcessor] setExtensionPrompt不可用，使用window变量");
     }
 }
 
-// 4. 构建标准的酒馆 UI (使用 addExtensionControls)
-function setupUI() {
-    const settings = extension_settings[MODULE_NAME];
-    
-    // 移除 inline-drawer 等包装，因为 addExtensionControls 会自动帮你包装
-    const html = `
-    <div class="memory-processor-settings">
-        <div class="flex-container">
-            <label class="checkbox_label">
-                <input type="checkbox" id="mp-enabled" ${settings.enabled ? 'checked' : ''}>
-                <span>启用记忆处理</span>
-            </label>
+// ===== UI =====
+const settingsHtml = `
+<div id="memory_processor_settings">
+    <div class="inline-drawer">
+        <div class="inline-drawer-toggle inline-drawer-header">
+            <b>🧠 Memory Processor</b>
+            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
-        
-        <div class="margin-top-10">
-            <label>API URL:</label>
-            <input type="text" id="mp-url" class="text_pole" value="${settings.apiUrl || ''}" placeholder="https://api.xxx.com/v1/chat/completions">
+        <div class="inline-drawer-content">
+            <div style="padding: 10px;">
+                
+                <label class="checkbox_label" style="margin-bottom: 10px;">
+                    <input type="checkbox" id="mp_enabled">
+                    <span>启用记忆处理</span>
+                </label>
+                
+                <hr>
+                
+                <label>API URL (OpenAI格式)</label>
+                <input type="text" id="mp_api_url" class="text_pole" placeholder="https://your-proxy/v1/chat/completions">
+                
+                <label>API Key</label>
+                <input type="password" id="mp_api_key" class="text_pole" placeholder="sk-...">
+                
+                <label>模型名称</label>
+                <input type="text" id="mp_model" class="text_pole" placeholder="gpt-3.5-turbo">
+                
+                <label>最大历史消息数</label>
+                <input type="number" id="mp_max_history" class="text_pole" value="50" min="5" max="200">
+                
+                <hr>
+                
+                <label>记忆处理Prompt</label>
+                <textarea id="mp_prompt" class="text_pole" rows="8" style="font-size: 12px;"></textarea>
+                
+                <hr>
+                
+                <div style="display: flex; gap: 10px; margin-top: 10px;">
+                    <button id="mp_test" class="menu_button">🧪 测试</button>
+                    <button id="mp_clear" class="menu_button">🗑️ 清除缓存</button>
+                </div>
+                
+                <div id="mp_status" style="margin-top: 10px; padding: 10px; border-radius: 5px; display: none; white-space: pre-wrap; font-size: 12px; max-height: 200px; overflow-y: auto;"></div>
+                
+            </div>
         </div>
-        
-        <div class="margin-top-10">
-            <label>API Key:</label>
-            <input type="password" id="mp-key" class="text_pole" value="${settings.apiKey || ''}">
-        </div>
-        
-        <div class="margin-top-10">
-            <label>模型名称:</label>
-            <input type="text" id="mp-model" class="text_pole" value="${settings.model || ''}">
-        </div>
-
-        <div class="margin-top-10">
-            <label>最大处理历史数:</label>
-            <input type="number" id="mp-max" class="text_pole" value="${settings.maxHistoryMessages}">
-        </div>
-
-        <div class="margin-top-10">
-            <label>自定义Prompt:</label>
-            <textarea id="mp-prompt" class="text_pole" rows="4">${settings.memoryPrompt}</textarea>
-        </div>
-
-        <div class="margin-top-10">
-            <button id="mp-test" class="menu_button">测试并保存设置</button>
-        </div>
-        
-        <div id="mp-status" style="margin-top:10px; opacity:0.8; font-family:monospace; font-size:10px;">状态: 就绪</div>
     </div>
-    `;
+</div>
+`;
 
-    // 关键：调用酒馆原生 API 注册面板
-    addExtensionControls(html, "Memory Processor", () => {
-        // 绑定事件逻辑
-        $("#mp-enabled").on("change", function() {
-            settings.enabled = $(this).is(":checked");
-            saveSettingsDebounced();
-        });
-        $("#mp-url").on("input", function() { settings.apiUrl = $(this).val(); saveSettingsDebounced(); });
-        $("#mp-key").on("input", function() { settings.apiKey = $(this).val(); saveSettingsDebounced(); });
-        $("#mp-model").on("input", function() { settings.model = $(this).val(); saveSettingsDebounced(); });
-        $("#mp-max").on("input", function() { settings.maxHistoryMessages = parseInt($(this).val()); saveSettingsDebounced(); });
-        $("#mp-prompt").on("input", function() { settings.memoryPrompt = $(this).val(); saveSettingsDebounced(); });
+// ===== 绑定UI事件 =====
+function bindEvents() {
+    const settings = getSettings();
 
-        $("#mp-test").on("click", async () => {
-            $("#mp-status").text("状态: 正在调用测试...");
-            const res = await callMemoryAPI("这是一条测试消息。");
-            if (res) {
-                $("#mp-status").html(`<span style="color:var(--green);">成功!</span><br>预览: ${res.substring(0, 30)}...`);
+    // 初始化UI值
+    $("#mp_enabled").prop("checked", settings.enabled);
+    $("#mp_api_url").val(settings.apiUrl);
+    $("#mp_api_key").val(settings.apiKey);
+    $("#mp_model").val(settings.model);
+    $("#mp_max_history").val(settings.maxHistoryMessages);
+    $("#mp_prompt").val(settings.memoryPrompt);
+
+    // 事件绑定
+    $("#mp_enabled").on("change", function() {
+        settings.enabled = this.checked;
+        saveSettings();
+    });
+
+    $("#mp_api_url").on("input", function() {
+        settings.apiUrl = this.value.trim();
+        saveSettings();
+    });
+
+    $("#mp_api_key").on("input", function() {
+        settings.apiKey = this.value.trim();
+        saveSettings();
+    });
+
+    $("#mp_model").on("input", function() {
+        settings.model = this.value.trim();
+        saveSettings();
+    });
+
+    $("#mp_max_history").on("input", function() {
+        settings.maxHistoryMessages = parseInt(this.value) || 50;
+        saveSettings();
+    });
+
+    $("#mp_prompt").on("input", function() {
+        settings.memoryPrompt = this.value;
+        saveSettings();
+    });
+
+    // 测试按钮
+    $("#mp_test").on("click", async function() {
+        const $status = $("#mp_status");
+        $status.show().css("background", "#333").text("⏳ 正在处理...");
+        
+        try {
+            // 强制重新处理
+            settings.cachedMemory = "";
+            settings.lastProcessedLength = 0;
+            
+            const memory = await processMemory();
+            
+            if (memory) {
+                $status.css("background", "#1a4d1a").text("✅ 成功！\n\n" + memory);
             } else {
-                $("#mp-status").html(`<span style="color:var(--red);">失败!</span> 请检查API配置或控制台。`);
+                $status.css("background", "#4d1a1a").text("❌ 失败，请检查控制台(F12)");
             }
-        });
-    }, "fas fa-brain");
+        } catch (e) {
+            $status.css("background", "#4d1a1a").text("❌ 错误: " + e.message);
+        }
+    });
+
+    // 清除缓存按钮
+    $("#mp_clear").on("click", function() {
+        settings.cachedMemory = "";
+        settings.lastProcessedLength = 0;
+        saveSettings();
+        $("#mp_status").show().css("background", "#333").text("🗑️ 缓存已清除");
+    });
 }
 
-// 5. 初始化入口
-(function() {
+// ===== 生成前钩子 =====
+async function onGenerationStarted() {
+    const settings = getSettings();
+    if (!settings.enabled) return;
+    
+    console.log("[MemoryProcessor] 生成前钩子触发");
+    const memory = await processMemory();
+    injectMemory(memory);
+}
+
+// ===== 插件入口 =====
+jQuery(async () => {
+    console.log("[MemoryProcessor] 加载中...");
+
     loadSettings();
-    registerExtension(MODULE_NAME);
-    setupUI();
-    eventSource.on(event_types.GENERATION_STARTED, onGenerateBefore);
-    console.log("[MemoryProcessor] 插件加载成功");
-})();
+
+    // 添加UI到扩展设置区域
+    $("#extensions_settings2").append(settingsHtml);
+    
+    bindEvents();
+
+    // 注册生成前事件
+    const { eventSource, event_types } = await import("../../../../script.js");
+    eventSource.on(event_types.GENERATION_STARTED, onGenerationStarted);
+
+    console.log("[MemoryProcessor] 加载完成 ✓");
+});
