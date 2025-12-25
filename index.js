@@ -1,6 +1,6 @@
 /*
- * Memory Processor Extension v1.1
- * 修正：API兼容性 + 时间标注
+ * Memory Processor Extension v1.2
+ * 新增：自动注入世界书 + 完整查看窗口
  */
 
 import { saveSettingsDebounced } from "../../../../script.js";
@@ -15,6 +15,8 @@ const defaultSettings = {
     apiKey: "",
     model: "gpt-3.5-turbo",
     maxHistoryMessages: 50,
+    injectToWorldInfo: true,  // 新增：是否注入世界书
+    autoUpdate: true,  // 新增：是否自动更新
     memoryPrompt: `# 记忆处理器
 
 ## 任务
@@ -40,7 +42,6 @@ const defaultSettings = {
     lastProcessedLength: 0
 };
 
-// ===== 加载设置 =====
 function loadSettings() {
     extension_settings[extensionName] = extension_settings[extensionName] || {};
     for (const [key, value] of Object.entries(defaultSettings)) {
@@ -58,7 +59,6 @@ function saveSettings() {
     saveSettingsDebounced();
 }
 
-// ===== 格式化历史 =====
 function formatHistory(chatHistory, maxMessages) {
     const recent = chatHistory.slice(-maxMessages);
     let text = "";
@@ -68,23 +68,19 @@ function formatHistory(chatHistory, maxMessages) {
         if (!msg.mes || msg.mes.trim() === "") continue;
         msgIndex++;
         const role = msg.is_user ? "【用户】" : "【AI】";
-        // 添加消息序号，帮助AI判断时间远近
         text += `[消息${msgIndex}] ${role}\n${msg.mes}\n\n`;
     }
     
     return text;
 }
 
-// ===== 调用API =====
 async function callMemoryAPI(historyText) {
     const settings = getSettings();
     
     if (!settings.apiUrl) {
-        console.error("[MemoryProcessor] API URL 未配置");
-        return null;
+        throw new Error("API URL 未配置");
     }
 
-    // 构建请求体 - 最简格式，兼容性最好
     const requestBody = {
         model: settings.model,
         messages: [
@@ -99,80 +95,51 @@ async function callMemoryAPI(historyText) {
         ]
     };
 
-    // 构建headers
     const headers = {
         "Content-Type": "application/json"
     };
     
-    // 只有填了key才加Authorization
     if (settings.apiKey && settings.apiKey.trim() !== "") {
         headers["Authorization"] = `Bearer ${settings.apiKey}`;
     }
 
     console.log("[MemoryProcessor] 发送请求到:", settings.apiUrl);
-    console.log("[MemoryProcessor] 请求体:", JSON.stringify(requestBody, null, 2));
 
-    try {
-        const response = await fetch(settings.apiUrl, {
-            method: "POST",
-            headers: headers,
-            body: JSON.stringify(requestBody)
-        });
+    const response = await fetch(settings.apiUrl, {
+        method: "POST",
+        headers: headers,
+        body: JSON.stringify(requestBody)
+    });
 
-        console.log("[MemoryProcessor] 响应状态:", response.status);
-
-        if (!response.ok) {
-            const errorText = await response.text();
-            console.error("[MemoryProcessor] API错误:", response.status, errorText);
-            throw new Error(`API返回 ${response.status}: ${errorText.substring(0, 200)}`);
-        }
-
-        const data = await response.json();
-        console.log("[MemoryProcessor] 响应数据:", data);
-        
-        // 尝试多种格式解析
-        let result = null;
-        
-        // OpenAI格式
-        if (data.choices && data.choices[0]) {
-            if (data.choices[0].message && data.choices[0].message.content) {
-                result = data.choices[0].message.content;
-            } else if (data.choices[0].text) {
-                result = data.choices[0].text;
-            }
-        }
-        
-        // Claude格式
-        if (!result && data.content && data.content[0]) {
-            if (data.content[0].text) {
-                result = data.content[0].text;
-            }
-        }
-        
-        // 直接content字段
-        if (!result && data.content && typeof data.content === 'string') {
-            result = data.content;
-        }
-        
-        // response字段
-        if (!result && data.response) {
-            result = data.response;
-        }
-
-        if (!result) {
-            console.error("[MemoryProcessor] 无法解析响应:", data);
-            throw new Error("无法解析API响应格式");
-        }
-
-        return result;
-
-    } catch (error) {
-        console.error("[MemoryProcessor] 请求失败:", error);
-        throw error;
+    if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`API返回 ${response.status}: ${errorText.substring(0, 200)}`);
     }
+
+    const data = await response.json();
+    
+    // 多格式解析
+    let result = null;
+    
+    if (data.choices?.[0]?.message?.content) {
+        result = data.choices[0].message.content;
+    } else if (data.choices?.[0]?.text) {
+        result = data.choices[0].text;
+    } else if (data.content?.[0]?.text) {
+        result = data.content[0].text;
+    } else if (typeof data.content === 'string') {
+        result = data.content;
+    } else if (data.response) {
+        result = data.response;
+    }
+
+    if (!result) {
+        throw new Error("无法解析API响应格式");
+    }
+
+    return result;
 }
 
-// ===== 处理记忆 =====
 async function processMemory(forceRefresh = false) {
     const settings = getSettings();
     if (!settings.enabled) return null;
@@ -185,7 +152,6 @@ async function processMemory(forceRefresh = false) {
         return null;
     }
 
-    // 检查缓存（除非强制刷新）
     const currentLength = chatHistory.length;
     if (!forceRefresh && settings.cachedMemory && Math.abs(currentLength - settings.lastProcessedLength) < 5) {
         console.log("[MemoryProcessor] 使用缓存");
@@ -206,29 +172,77 @@ async function processMemory(forceRefresh = false) {
     return memory;
 }
 
-// ===== 注入记忆 =====
-function injectMemory(memory) {
+// ===== 注入记忆到世界书 =====
+async function injectMemory(memory) {
     if (!memory) return;
     
-    const memoryBlock = `[MEMORY_CONTEXT]
-# 你的记忆
+    const settings = getSettings();
+    const memoryBlock = `# 你的记忆（攻方视角）
 
-以下是你（攻方）脑子里记得的事。
-时间标注是相对于"现在"的。
+以下是你脑子里记得的事。时间标注是相对于"现在"的。
 
 ${memory}
 
 ---`;
     
+    console.log("[MemoryProcessor] 准备注入记忆");
+    
+    // 保存到window（供手动查看）
     window.memoryProcessorResult = memoryBlock;
+    
+    if (!settings.injectToWorldInfo) {
+        console.log("[MemoryProcessor] 世界书注入已禁用");
+        return;
+    }
     
     try {
         const context = getContext();
-        if (context.setExtensionPrompt) {
-            context.setExtensionPrompt(extensionName, memoryBlock, 1, 0);
+        
+        // 确保世界书数组存在
+        if (!context.worldInfoData) {
+            context.worldInfoData = [];
         }
+        
+        // 查找或创建记忆条目
+        let memoryEntry = context.worldInfoData.find(e => e.comment === "MEMORY_PROCESSOR_AUTO");
+        
+        if (!memoryEntry) {
+            console.log("[MemoryProcessor] 创建新的世界书条目");
+            
+            memoryEntry = {
+                uid: Date.now(),
+                comment: "MEMORY_PROCESSOR_AUTO",
+                key: [],  // 空key，依赖constant激活
+                keysecondary: [],
+                content: memoryBlock,
+                constant: true,  // 始终激活
+                selective: false,
+                order: 100,
+                position: 0,
+                disable: false,
+                excludeRecursion: false,
+                probability: 100,
+                useProbability: false
+            };
+            
+            context.worldInfoData.push(memoryEntry);
+        } else {
+            console.log("[MemoryProcessor] 更新已有世界书条目");
+            memoryEntry.content = memoryBlock;
+            memoryEntry.constant = true;
+            memoryEntry.disable = false;
+        }
+        
+        // 保存世界书
+        if (context.saveWorldInfo) {
+            await context.saveWorldInfo();
+            console.log("[MemoryProcessor] 记忆已注入世界书 ✓");
+        } else {
+            console.warn("[MemoryProcessor] saveWorldInfo方法不可用");
+        }
+        
     } catch (e) {
-        console.log("[MemoryProcessor] 使用window变量存储");
+        console.error("[MemoryProcessor] 注入世界书失败:", e);
     }
 }
 
@@ -248,18 +262,25 @@ const settingsHtml = `
                     <span>启用记忆处理</span>
                 </label>
                 
+                <label class="checkbox_label" style="margin-bottom: 10px;">
+                    <input type="checkbox" id="mp_inject_wi">
+                    <span>自动注入世界书</span>
+                </label>
+                
+                <label class="checkbox_label" style="margin-bottom: 10px;">
+                    <input type="checkbox" id="mp_auto_update">
+                    <span>自动更新（每次生成前）</span>
+                </label>
+                
                 <hr>
                 
                 <label>API URL</label>
                 <small style="display:block; color:#888; margin-bottom:5px;">
-                    填完整地址，例如: https://xxx.com/v1/chat/completions
+                    完整地址，例如: https://xxx.com/v1/chat/completions
                 </small>
                 <input type="text" id="mp_api_url" class="text_pole" placeholder="https://your-api/v1/chat/completions">
                 
                 <label>API Key（可选）</label>
-                <small style="display:block; color:#888; margin-bottom:5px;">
-                    如果反代不需要key可以留空
-                </small>
                 <input type="password" id="mp_api_key" class="text_pole" placeholder="sk-... 或留空">
                 
                 <label>模型名称</label>
@@ -275,13 +296,14 @@ const settingsHtml = `
                 
                 <hr>
                 
-                <div style="display: flex; gap: 10px; margin-top: 10px;">
+                <div style="display: flex; gap: 10px; margin-top: 10px; flex-wrap: wrap;">
                     <button id="mp_test" class="menu_button">🧪 测试</button>
                     <button id="mp_clear" class="menu_button">🗑️ 清缓存</button>
-                    <button id="mp_copy" class="menu_button">📋 复制结果</button>
+                    <button id="mp_view_full" class="menu_button">👁️ 查看完整</button>
+                    <button id="mp_copy" class="menu_button">📋 复制</button>
                 </div>
                 
-                <div id="mp_status" style="margin-top: 10px; padding: 10px; border-radius: 5px; display: none; white-space: pre-wrap; font-size: 11px; max-height: 300px; overflow-y: auto; background: #222;"></div>
+                <div id="mp_status" style="margin-top: 10px; padding: 10px; border-radius: 5px; display: none; white-space: pre-wrap; font-size: 11px; max-height: 200px; overflow-y: auto; background: #222;"></div>
                 
             </div>
         </div>
@@ -289,21 +311,30 @@ const settingsHtml = `
 </div>
 `;
 
-// ===== 绑定UI事件 =====
 function bindEvents() {
     const settings = getSettings();
 
-    // 初始化UI值
     $("#mp_enabled").prop("checked", settings.enabled);
+    $("#mp_inject_wi").prop("checked", settings.injectToWorldInfo);
+    $("#mp_auto_update").prop("checked", settings.autoUpdate);
     $("#mp_api_url").val(settings.apiUrl);
     $("#mp_api_key").val(settings.apiKey);
     $("#mp_model").val(settings.model);
     $("#mp_max_history").val(settings.maxHistoryMessages);
     $("#mp_prompt").val(settings.memoryPrompt);
 
-    // 事件绑定
     $("#mp_enabled").on("change", function() {
         settings.enabled = this.checked;
+        saveSettings();
+    });
+    
+    $("#mp_inject_wi").on("change", function() {
+        settings.injectToWorldInfo = this.checked;
+        saveSettings();
+    });
+    
+    $("#mp_auto_update").on("change", function() {
+        settings.autoUpdate = this.checked;
         saveSettings();
     });
 
@@ -338,24 +369,25 @@ function bindEvents() {
         const $btn = $(this);
         
         $btn.prop("disabled", true).text("⏳ 处理中...");
-        $status.show().css("color", "#aaa").text("正在调用API...\n\n请查看控制台(F12)获取详细日志");
+        $status.show().css("color", "#aaa").text("正在调用API...");
         
         try {
-            const memory = await processMemory(true); // 强制刷新
+            const memory = await processMemory(true);
             
             if (memory) {
-                $status.css("color", "#8f8").text("✅ 成功！\n\n" + memory);
+                await injectMemory(memory);
+                $status.css("color", "#8f8").text("✅ 成功！已注入世界书\n\n" + memory.substring(0, 300) + (memory.length > 300 ? "\n\n..." : ""));
             } else {
-                $status.css("color", "#f88").text("❌ 返回为空\n\n请检查控制台(F12)");
+                $status.css("color", "#f88").text("❌ 返回为空");
             }
         } catch (e) {
-            $status.css("color", "#f88").text("❌ 错误:\n\n" + e.message + "\n\n请检查控制台(F12)获取详情");
+            $status.css("color", "#f88").text("❌ 错误:\n\n" + e.message);
         } finally {
             $btn.prop("disabled", false).text("🧪 测试");
         }
     });
 
-    // 清除缓存按钮
+    // 清除缓存
     $("#mp_clear").on("click", function() {
         settings.cachedMemory = "";
         settings.lastProcessedLength = 0;
@@ -363,13 +395,50 @@ function bindEvents() {
         $("#mp_status").show().css("color", "#aaa").text("🗑️ 缓存已清除");
     });
     
-    // 复制结果按钮
+    // 查看完整记忆
+    $("#mp_view_full").on("click", function() {
+        const memory = settings.cachedMemory;
+        
+        if (!memory) {
+            alert("暂无缓存的记忆，请先点击测试");
+            return;
+        }
+        
+        const modal = $(`
+            <div class="mp-modal" style="position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 9999; display: flex; align-items: center; justify-content: center;">
+                <div style="background: #1a1a1a; padding: 20px; border-radius: 10px; max-width: 800px; max-height: 80vh; overflow-y: auto; position: relative;">
+                    <div style="position: sticky; top: 0; background: #1a1a1a; padding-bottom: 10px; margin-bottom: 10px; border-bottom: 1px solid #444; display: flex; justify-content: space-between; align-items: center; z-index: 1;">
+                        <h3 style="margin: 0;">🧠 完整记忆</h3>
+                        <div>
+                            <button class="mp-modal-copy menu_button" style="margin-right: 10px;">📋 复制</button>
+                            <button class="mp-modal-close menu_button">✕ 关闭</button>
+                        </div>
+                    </div>
+                    <pre style="white-space: pre-wrap; font-size: 13px; line-height: 1.6; color: #ddd; margin: 0;">${memory}</pre>
+                </div>
+            </div>
+        `);
+        
+        $("body").append(modal);
+        
+        modal.find(".mp-modal-close").on("click", () => modal.remove());
+        modal.find(".mp-modal-copy").on("click", function() {
+            navigator.clipboard.writeText(memory);
+            $(this).text("✓ 已复制");
+            setTimeout(() => $(this).text("📋 复制"), 1500);
+        });
+        modal.on("click", function(e) {
+            if (e.target === this) modal.remove();
+        });
+    });
+    
+    // 复制结果
     $("#mp_copy").on("click", function() {
-        const text = $("#mp_status").text();
+        const text = settings.cachedMemory;
         if (text) {
             navigator.clipboard.writeText(text);
             $(this).text("✓ 已复制").prop("disabled", true);
-            setTimeout(() => $(this).text("📋 复制结果").prop("disabled", false), 1500);
+            setTimeout(() => $(this).text("📋 复制").prop("disabled", false), 1500);
         }
     });
 }
@@ -377,15 +446,17 @@ function bindEvents() {
 // ===== 生成前钩子 =====
 async function onGenerationStarted() {
     const settings = getSettings();
-    if (!settings.enabled) return;
+    if (!settings.enabled || !settings.autoUpdate) return;
     
-    console.log("[MemoryProcessor] 生成前钩子触发");
+    console.log("[MemoryProcessor] 自动更新触发");
     
     try {
         const memory = await processMemory();
-        injectMemory(memory);
+        if (memory) {
+            await injectMemory(memory);
+        }
     } catch (e) {
-        console.error("[MemoryProcessor] 处理失败:", e);
+        console.error("[MemoryProcessor] 自动更新失败:", e);
     }
 }
 
@@ -394,12 +465,9 @@ jQuery(async () => {
     console.log("[MemoryProcessor] 加载中...");
 
     loadSettings();
-
-    // 添加UI
     $("#extensions_settings2").append(settingsHtml);
     bindEvents();
 
-    // 注册生成前事件
     try {
         const { eventSource, event_types } = await import("../../../../script.js");
         eventSource.on(event_types.GENERATION_STARTED, onGenerationStarted);
